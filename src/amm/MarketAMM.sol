@@ -4,17 +4,19 @@ pragma solidity ^0.8.20;
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "../interfaces/IConditionalTokens.sol";
 import "./AMMHelper.sol";
 
 /**
  * @title MarketAMM
- * @notice This version adds a post-resolution claim function for LPs.
+ * @notice Manages liquidity and trading for a single prediction market. Deployed as a clone by MarketFactory.
  */
 contract MarketAMM is ERC20, ReentrancyGuard {
     using AMMHelper for uint256;
+    using SafeERC20 for IERC20;
 
-    // --- Structs (no change) ---
+    // --- Structs ---
     struct TradeRecord {
         address trader;
         uint256 outcomeIndex;
@@ -29,7 +31,7 @@ contract MarketAMM is ERC20, ReentrancyGuard {
         uint256 lpTokensOwned;
     }
 
-    // --- Constants (no change)---
+    // --- Constants ---
     uint256 public constant YES_OUTCOME_INDEX = 2;
     uint256 public constant NO_OUTCOME_INDEX = 1;
     uint256[] private FULL_SET_INDEXES = [1, 2];
@@ -44,27 +46,32 @@ contract MarketAMM is ERC20, ReentrancyGuard {
     uint256 public platformFeeOnLpEarningsBps;
     address public platformFeeRecipient;
     uint256 public totalVolume;
-    bool public isResolved; // NEW: Flag to lock the AMM
+    bool public isResolved;
 
     uint256 public reserveYes;
     uint256 public reserveNo;
 
     mapping(address => uint256) public principalDeposited;
     TradeRecord[] public tradeHistory;
- constructor() ERC20("PM LP Token", "PMLP") {}
+
+    // --- Constructor ---
+    // This constructor is required to satisfy the ERC20 base contract.
+    // It runs only for the base logic contract, not for the clones.
+    constructor() ERC20("PM LP Token", "PMLP") {}
+
     // --- Modifiers ---
     modifier onlyUnresolved() {
         require(!isResolved, "AMM: Market is resolved");
         _;
     }
 
-    // --- Events (no change) ---
+    // --- Events ---
     event LiquidityAdded(address indexed provider, uint256 collateralAmount, uint256 lpAmount);
     event LiquidityRemoved(address indexed provider, uint256 collateralAmount, uint256 lpAmount);
     event Trade(address indexed trader, uint256 amountIn, uint256 amountOut, uint256 positionId);
-    event MarketLocked(uint256 winningOutcome); // NEW Event
+    event MarketLocked(uint256 winningOutcome);
 
-    // --- Initializer (no change) ---
+    // --- Initializer ---
     function initialize(
         address _conditionalTokens,
         address _collateral,
@@ -74,7 +81,7 @@ contract MarketAMM is ERC20, ReentrancyGuard {
         address _feeRecipient
     ) external {
         require(address(collateralToken) == address(0), "AMM: Already initialized");
-        // _initializeERC20("PM LP Token", "PMLP");
+        // The ERC20 name and symbol are set in the constructor.
         conditionalTokens = IConditionalTokens(_conditionalTokens);
         collateralToken = IERC20(_collateral);
         conditionId = _conditionId;
@@ -83,50 +90,41 @@ contract MarketAMM is ERC20, ReentrancyGuard {
         platformFeeRecipient = _feeRecipient;
         positionIdYes = conditionalTokens.getPositionId(address(collateralToken), conditionId, YES_OUTCOME_INDEX);
         positionIdNo = conditionalTokens.getPositionId(address(collateralToken), conditionId, NO_OUTCOME_INDEX);
+
+        // Approve the conditional tokens contract to spend this contract's collateral
+        collateralToken.approve(address(conditionalTokens), type(uint256).max);
     }
-    
-    // function _initializeERC20(string memory name, string memory symbol) private {
-    //     (bool success, bytes memory returnData) = address(this).staticcall(abi.encodeWithSignature("name()"));
-    //     if (success && returnData.length > 0) {} else {}
-    // }
 
-    // --- NEW: Post-Resolution Functions ---
-
-    /**
-     * @notice Locks the AMM after resolution. Only callable by the factory.
-     * @dev It merges all worthless tokens, leaving only the winning tokens in the reserves.
-     */
+    // --- Post-Resolution Functions ---
     function setResolved(uint256 winningOutcome) external {
-        // In a real implementation, you'd add access control (e.g., onlyFactory)
+        // In a real implementation, this should have access control (e.g., onlyFactory)
         require(!isResolved, "AMM: Already resolved");
         isResolved = true;
         
-        // Consolidate reserves into the winning token
         if (winningOutcome == YES_OUTCOME_INDEX) {
-            // The "No" tokens are worthless. Merge them with an equal amount of "Yes" tokens.
             uint256 amountToMerge = reserveNo;
-            reserveYes -= amountToMerge;
-            reserveNo = 0;
-            conditionalTokens.mergePositions(address(collateralToken), bytes32(0), conditionId, FULL_SET_INDEXES, amountToMerge);
-        } else { // NO_OUTCOME_INDEX
+            if(amountToMerge > 0){
+                reserveYes -= amountToMerge;
+                reserveNo = 0;
+                conditionalTokens.mergePositions(address(collateralToken), bytes32(0), conditionId, FULL_SET_INDEXES, amountToMerge);
+            }
+        } else {
             uint256 amountToMerge = reserveYes;
-            reserveNo -= amountToMerge;
-            reserveYes = 0;
-            conditionalTokens.mergePositions(address(collateralToken), bytes32(0), conditionId, FULL_SET_INDEXES, amountToMerge);
+             if(amountToMerge > 0){
+                reserveNo -= amountToMerge;
+                reserveYes = 0;
+                conditionalTokens.mergePositions(address(collateralToken), bytes32(0), conditionId, FULL_SET_INDEXES, amountToMerge);
+            }
         }
 
         emit MarketLocked(winningOutcome);
     }
     
-    /**
-     * @notice Allows LPs to claim their share of winning tokens after resolution.
-     */
     function claimLpWinnings() external nonReentrant {
         require(isResolved, "AMM: Market not resolved");
         uint256 lpAmount = balanceOf(msg.sender);
         require(lpAmount > 0, "AMM: No LP tokens");
 
-        // After resolution, one reserve is 0. The total supply of winning tokens is the non-zero reserve.
         uint256 totalWinningTokens = reserveYes > 0 ? reserveYes : reserveNo;
         uint256 winningPositionId = reserveYes > 0 ? positionIdYes : positionIdNo;
         
@@ -134,16 +132,15 @@ contract MarketAMM is ERC20, ReentrancyGuard {
 
         _burn(msg.sender, lpAmount);
         
-        // Transfer the winning tokens to the LP for them to redeem
+        // This transfer can't use SafeERC20 because IConditionalTokens is not an ERC20 contract.
+        // It's an ERC1155, and OpenZeppelin's ERC1155 implementation has its own safety checks.
         conditionalTokens.safeTransferFrom(address(this), msg.sender, winningPositionId, userShare, "");
     }
 
-
-    // --- Core Functions (now with modifier) ---
+    // --- Core Functions ---
     function addLiquidity(uint256 collateralAmount) external nonReentrant onlyUnresolved returns (uint256 lpAmount) {
-        // ... implementation is the same ...
         require(collateralAmount > 0, "AMM: Zero amount");
-        collateralToken.transferFrom(msg.sender, address(this), collateralAmount);
+        collateralToken.safeTransferFrom(msg.sender, address(this), collateralAmount);
         conditionalTokens.splitPosition(address(collateralToken), bytes32(0), conditionId, FULL_SET_INDEXES, collateralAmount);
         uint256 oldK = reserveYes * reserveNo;
         reserveYes += collateralAmount;
@@ -160,41 +157,50 @@ contract MarketAMM is ERC20, ReentrancyGuard {
     }
 
     function removeLiquidity(uint256 lpAmount) external nonReentrant onlyUnresolved returns (uint256 collateralAmountOut) {
-        // ... implementation is the same ...
         require(lpAmount > 0, "AMM: Zero amount");
         require(balanceOf(msg.sender) >= lpAmount, "AMM: Insufficient LP tokens");
         uint256 userLpBalance = balanceOf(msg.sender);
         uint256 currentTotalSupply = totalSupply();
         collateralAmountOut = AMMHelper.getLpShareValue(reserveYes, reserveNo, currentTotalSupply, lpAmount);
         uint256 principalToWithdraw = (principalDeposited[msg.sender] * lpAmount) / userLpBalance;
+        
         uint256 profit = 0;
         if (collateralAmountOut > principalToWithdraw) {
             profit = collateralAmountOut - principalToWithdraw;
         }
+        
         uint256 platformFee = (profit * platformFeeOnLpEarningsBps) / 10000;
+        
         uint256 yesTokensToRemove = (reserveYes * lpAmount) / currentTotalSupply;
         uint256 noTokensToRemove = (reserveNo * lpAmount) / currentTotalSupply;
         reserveYes -= yesTokensToRemove;
         reserveNo -= noTokensToRemove;
+        
         _burn(msg.sender, lpAmount);
         principalDeposited[msg.sender] -= principalToWithdraw;
+        
         conditionalTokens.mergePositions(address(collateralToken), bytes32(0), conditionId, FULL_SET_INDEXES, collateralAmountOut);
+        
         if (platformFee > 0) {
-            collateralToken.transfer(platformFeeRecipient, platformFee);
+            collateralToken.safeTransfer(platformFeeRecipient, platformFee);
         }
-        collateralToken.transfer(msg.sender, collateralAmountOut - platformFee);
+        collateralToken.safeTransfer(msg.sender, collateralAmountOut - platformFee);
+        
         emit LiquidityRemoved(msg.sender, collateralAmountOut, lpAmount);
     }
 
     function swap(uint256 amountIn, uint256 outcomeIndex, uint256 minAmountOut) external nonReentrant onlyUnresolved returns (uint256 amountOut) {
-        // ... implementation is the same ...
         require(outcomeIndex == YES_OUTCOME_INDEX || outcomeIndex == NO_OUTCOME_INDEX, "MarketAMM: Invalid outcome");
         require(amountIn > 0, "MarketAMM: Zero input amount");
+        
         uint256 fee = (amountIn * tradingFeeBps) / 10000;
         uint256 amountInAfterFee = amountIn - fee;
-        collateralToken.transferFrom(msg.sender, address(this), amountIn);
+        
+        collateralToken.safeTransferFrom(msg.sender, address(this), amountIn);
         conditionalTokens.splitPosition(address(collateralToken), bytes32(0), conditionId, FULL_SET_INDEXES, amountIn);
+        
         uint256 k = reserveYes * reserveNo;
+        
         if (outcomeIndex == YES_OUTCOME_INDEX) {
             amountOut = reserveYes - (k / (reserveNo + amountInAfterFee));
             require(amountOut >= minAmountOut, "MarketAMM: Slippage exceeded");
@@ -210,26 +216,32 @@ contract MarketAMM is ERC20, ReentrancyGuard {
             conditionalTokens.safeTransferFrom(address(this), msg.sender, positionIdNo, amountOut, "");
             emit Trade(msg.sender, amountIn, amountOut, positionIdNo);
         }
+        
         totalVolume += amountIn;
         tradeHistory.push(TradeRecord({trader: msg.sender, outcomeIndex: outcomeIndex, collateralIn: amountIn, tokensOut: amountOut, timestamp: block.timestamp}));
+        return amountOut;
     }
     
     function sell(uint256 amountIn, uint256 outcomeIndex, uint256 minAmountOut) external nonReentrant onlyUnresolved returns (uint256 collateralAmountOut) {
-        // ... implementation is the same ...
         require(amountIn > 0, "MarketAMM: Zero input amount");
         require(outcomeIndex == YES_OUTCOME_INDEX || outcomeIndex == NO_OUTCOME_INDEX, "MarketAMM: Invalid outcome");
+        
         uint256 k = reserveYes * reserveNo;
         uint256 tokensOut;
+        
         if (outcomeIndex == YES_OUTCOME_INDEX) {
             tokensOut = reserveNo - (k / (reserveYes + amountIn));
         } else {
             tokensOut = reserveYes - (k / (reserveNo + amountIn));
         }
+        
         uint256 fee = (tokensOut * tradingFeeBps) / 10000;
         collateralAmountOut = tokensOut - fee;
         require(collateralAmountOut >= minAmountOut, "MarketAMM: Slippage exceeded");
+        
         uint256 positionIdIn = outcomeIndex == YES_OUTCOME_INDEX ? positionIdYes : positionIdNo;
         conditionalTokens.safeTransferFrom(msg.sender, address(this), positionIdIn, amountIn, "");
+        
         if (outcomeIndex == YES_OUTCOME_INDEX) {
             reserveYes = reserveYes + amountIn - collateralAmountOut;
             reserveNo -= collateralAmountOut;
@@ -237,22 +249,36 @@ contract MarketAMM is ERC20, ReentrancyGuard {
             reserveNo = reserveNo + amountIn - collateralAmountOut;
             reserveYes -= collateralAmountOut;
         }
+        
         conditionalTokens.mergePositions(address(collateralToken), bytes32(0), conditionId, FULL_SET_INDEXES, collateralAmountOut);
-        collateralToken.transfer(msg.sender, collateralAmountOut);
+        collateralToken.safeTransfer(msg.sender, collateralAmountOut);
+        return collateralAmountOut;
     }
 
-    // --- View Functions (no change) ---
+    // --- View Functions ---
     function getLpPosition(address provider) external view returns (LpPosition memory) {
         uint256 lpTokens = balanceOf(provider);
         uint256 currentValue = AMMHelper.getLpShareValue(reserveYes, reserveNo, totalSupply(), lpTokens);
         uint256 principal = principalDeposited[provider];
         return LpPosition({principal: principal, currentValue: currentValue, profit: int256(currentValue) - int256(principal), lpTokensOwned: lpTokens});
     }
+
     function getTotalPoolValue() external view returns (uint256) {
         return AMMHelper.getLpShareValue(reserveYes, reserveNo, totalSupply(), totalSupply());
     }
+
     function getTradeHistoryCount() external view returns (uint256) {
         return tradeHistory.length;
+    }
+
+    function getCurrentPrices() external view returns (uint256 yesPrice, uint256 noPrice) {
+        uint256 totalReserves = reserveYes + reserveNo;
+        if (totalReserves == 0) {
+            return (5 * 10**17, 5 * 10**17); // 0.5 for each if no liquidity
+        }
+        // Price is the proportion of the opposite reserve
+        yesPrice = (reserveNo * 10**18) / totalReserves;
+        noPrice = (reserveYes * 10**18) / totalReserves;
     }
 }
 
