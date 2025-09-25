@@ -5,6 +5,7 @@ import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ERC1155Holder} from "@openzeppelin/contracts/token/ERC1155/utils/ERC1155Holder.sol";
 import "../interfaces/IConditionalTokens.sol";
 import "./AMMHelper.sol";
 
@@ -12,7 +13,7 @@ import "./AMMHelper.sol";
  * @title MarketAMM
  * @notice Manages liquidity and trading for a single prediction market. Deployed as a clone by MarketFactory.
  */
-contract MarketAMM is ERC20, ReentrancyGuard {
+contract MarketAMM is ERC20, ReentrancyGuard, ERC1155Holder {
     using AMMHelper for uint256;
     using SafeERC20 for IERC20;
 
